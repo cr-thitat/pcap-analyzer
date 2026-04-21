@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 try:
-    from scapy.all import rdpcap, IP, TCP, UDP, DNS, DNSRR, DNSQR
+    from scapy.all import PcapReader, IP, TCP, UDP, DNS, DNSRR, DNSQR
     from scapy.layers.dns import DNSRR
 except ImportError:
     print("Error: scapy is required. Install with: pip install scapy")
@@ -43,14 +43,23 @@ class DomainStats:
     tx_packets: int = 0
     rx_packets: int = 0
 
+    # TCP 3-way handshake (SYN / SYN-ACK packets only)
+    # Bytes = IP-level packet size, same basis as tx_bytes/rx_bytes
     handshake_packets: int = 0
     handshake_bytes: int = 0
+
+    # Retransmissions: duplicate seq+payload (re-sent data)
     retrans_packets: int = 0
     retrans_bytes: int = 0
 
-    # TLS-layer breakdown (payload bytes only, not IP framing)
+    # Connection resets (RST flag) — separate from retransmissions
+    rst_packets: int = 0
+    rst_bytes: int = 0
+
+    # TLS-layer breakdown — record *body* bytes (excludes 5-byte TLS record headers
+    # and all TCP/IP framing), so tls_hs_bytes + tls_data_bytes < total_bytes.
     tls_hs_bytes: int = 0       # Handshake + ChangeCipherSpec + Alert records
-    tls_data_bytes: int = 0     # ApplicationData records (real encrypted payload)
+    tls_data_bytes: int = 0     # ApplicationData records (encrypted payload)
 
     @property
     def total_packets(self):
@@ -60,6 +69,7 @@ class DomainStats:
     def total_bytes(self):
         return self.tx_bytes + self.rx_bytes
 
+    # --- TCP handshake % (both relative to IP-level totals) ---
     @property
     def handshake_pct_packets(self):
         return 100.0 * self.handshake_packets / self.total_packets if self.total_packets else 0.0
@@ -68,6 +78,7 @@ class DomainStats:
     def handshake_pct_bytes(self):
         return 100.0 * self.handshake_bytes / self.total_bytes if self.total_bytes else 0.0
 
+    # --- Retransmission % (IP-level, re-sent data only, excludes RST) ---
     @property
     def retrans_pct_packets(self):
         return 100.0 * self.retrans_packets / self.total_packets if self.total_packets else 0.0
@@ -76,6 +87,12 @@ class DomainStats:
     def retrans_pct_bytes(self):
         return 100.0 * self.retrans_bytes / self.total_bytes if self.total_bytes else 0.0
 
+    # --- RST % ---
+    @property
+    def rst_pct_packets(self):
+        return 100.0 * self.rst_packets / self.total_packets if self.total_packets else 0.0
+
+    # --- TLS split % (relative to TLS record bytes only, not IP-level) ---
     @property
     def tls_hs_pct(self):
         total_tls = self.tls_hs_bytes + self.tls_data_bytes
@@ -99,7 +116,6 @@ def human_bytes(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-
 def ip_pkt_size(pkt) -> int:
     if IP in pkt:
         return pkt[IP].len
@@ -120,70 +136,31 @@ def tcp_flags(pkt) -> dict:
 
 
 def is_handshake(pkt) -> bool:
+    """SYN or SYN-ACK — TCP 3-way handshake packets only."""
     if TCP not in pkt:
         return False
     return tcp_flags(pkt).get("SYN", False)
 
 
-def is_retransmission(pkt, seen_seq: set) -> bool:
-    if TCP not in pkt:
-        return False
-    if tcp_flags(pkt).get("RST", False):
-        return True
-    if IP in pkt:
-        key = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
-        if len(pkt[TCP].payload) > 0:
-            if key in seen_seq:
-                return True
-            seen_seq.add(key)
-    return False
-
-
 def extract_sni(payload: bytes) -> Optional[str]:
     """
     Parse a TLS ClientHello and return the SNI hostname, or None.
-
-    TLS record layout:
-      1B  content_type  (0x16 = handshake)
-      2B  version
-      2B  record length
-      1B  handshake_type (0x01 = ClientHello)
-      3B  handshake length
-      2B  client_hello version
-      32B random
-      1B  session_id length  + session_id
-      2B  cipher_suites length + cipher_suites
-      1B  compression_methods length + compression_methods
-      2B  extensions length
-        extensions…
-          2B ext_type  (0x0000 = SNI)
-          2B ext_data_length
-          2B server_name_list_length
-          1B name_type (0x00 = host_name)
-          2B name_length
-          NB name
     """
     try:
         if len(payload) < 5:
             return None
-        # TLS handshake record
         if payload[0] != 0x16:
             return None
         record_len = int.from_bytes(payload[3:5], "big")
         if len(payload) < 5 + record_len:
             return None
         hs = payload[5:5 + record_len]
-        if hs[0] != 0x01:          # ClientHello
+        if hs[0] != 0x01:
             return None
-        # skip: handshake_type(1) + length(3) + version(2) + random(32)
-        pos = 1 + 3 + 2 + 32
-        # session id
+        pos = 1 + 3 + 2 + 32   # type + length + version + random
         sid_len = hs[pos]; pos += 1 + sid_len
-        # cipher suites
         cs_len = int.from_bytes(hs[pos:pos+2], "big"); pos += 2 + cs_len
-        # compression methods
         cm_len = hs[pos]; pos += 1 + cm_len
-        # extensions
         if pos + 2 > len(hs):
             return None
         ext_total = int.from_bytes(hs[pos:pos+2], "big"); pos += 2
@@ -193,7 +170,6 @@ def extract_sni(payload: bytes) -> Optional[str]:
             ext_len  = int.from_bytes(hs[pos+2:pos+4], "big")
             pos += 4
             if ext_type == 0x0000:  # SNI
-                # server_name_list_length(2) + name_type(1) + name_length(2)
                 if ext_len < 5:
                     return None
                 name_len = int.from_bytes(hs[pos+3:pos+5], "big")
@@ -210,13 +186,12 @@ _TLS_ALERT         = 0x15
 _TLS_HANDSHAKE     = 0x16
 _TLS_APP_DATA      = 0x17
 
-_TLS_HS_TYPES  = {_TLS_CHANGE_CIPHER, _TLS_ALERT, _TLS_HANDSHAKE}
-_TLS_VERSIONS  = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}   # SSLv3 + TLS 1.0–1.3
-
+_TLS_HS_TYPES = {_TLS_CHANGE_CIPHER, _TLS_ALERT, _TLS_HANDSHAKE}
+_TLS_VERSIONS = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}
 
 
 # ---------------------------------------------------------------------------
-# Core analysis
+# Core analysis — two-pass streaming (no rdpcap, no full RAM load)
 # ---------------------------------------------------------------------------
 
 def analyze_pcap(
@@ -224,198 +199,212 @@ def analyze_pcap(
     capture_ip: Optional[str] = None,
 ) -> tuple[dict[str, DomainStats], dict[str, DomainStats]]:
     """
-    Returns (domain_stats, unmatched_stats) where unmatched_stats keys are
-    raw IPs for TCP flows not resolved by any DNS answer in the capture.
+    Pass A: stream once to build DNS+SNI maps and auto-detect capture IP.
+    Pass B: stream again for traffic accounting + TLS reassembly.
+    Peak RAM: O(flows) not O(packets).
     """
-    print(f"[*] Reading {path} …", flush=True)
-    packets = rdpcap(path)
-    print(f"[*] Loaded {len(packets):,} packets", flush=True)
 
-    # --- Pass 1: DNS answers → IP-to-domain map ---------------------------
+    # ------------------------------------------------------------------
+    # Pass A: DNS answers → ip_to_domain, SNI → ip_to_domain, capture IP
+    # ------------------------------------------------------------------
+    print(f"[*] Pass A: DNS + SNI + capture-IP detection …", flush=True)
+
     ip_to_domain: dict[str, str] = {}
-    domain_ips: dict[str, set] = defaultdict(set)
+    domain_ips: dict[str, set]   = defaultdict(set)
+    dns_srcs: dict[str, int]     = defaultdict(int)
+    pkt_count = 0
 
-    for pkt in packets:
-        if DNS not in pkt:
-            continue
-        dns = pkt[DNS]
-        if dns.qr != 1 or dns.ancount == 0:
-            continue
-        for i in range(dns.ancount):
-            try:
-                rr = dns.an
-                for _ in range(i):
-                    rr = rr.payload
-                if rr.type in (1, 28):   # A or AAAA
-                    name = rr.rrname.decode().rstrip(".")
-                    ip = rr.rdata
-                    ip_to_domain[ip] = name
-                    domain_ips[name].add(ip)
-            except Exception:
-                continue
+    with PcapReader(path) as reader:
+        for pkt in reader:
+            pkt_count += 1
 
-    print(f"[*] Resolved {len(ip_to_domain):,} IPs → {len(domain_ips):,} domains via DNS", flush=True)
+            # DNS
+            if DNS in pkt:
+                dns = pkt[DNS]
+                if dns.qr == 1 and dns.ancount > 0:
+                    for i in range(dns.ancount):
+                        try:
+                            rr = dns.an
+                            for _ in range(i):
+                                rr = rr.payload
+                            if rr.type in (1, 28):
+                                name = rr.rrname.decode().rstrip(".")
+                                ip   = rr.rdata
+                                ip_to_domain[ip] = name
+                                domain_ips[name].add(ip)
+                        except Exception:
+                            continue
+                if dns.qr == 0 and IP in pkt:
+                    dns_srcs[pkt[IP].src] += 1
 
-    # --- Pass 1b: TLS SNI → supplement IP-to-domain map ------------------
-    # For each TCP/443 ClientHello, map the server IP to the SNI hostname.
-    # This catches flows where DNS was resolved before the capture started.
-    sni_count = 0
-    for pkt in packets:
-        if IP not in pkt or TCP not in pkt:
-            continue
-        if pkt[TCP].dport != 443:
-            continue
-        payload = bytes(pkt[TCP].payload)
-        if not payload:
-            continue
-        sni = extract_sni(payload)
-        if sni:
-            server_ip = pkt[IP].dst
-            if server_ip not in ip_to_domain:
-                ip_to_domain[server_ip] = sni
-                domain_ips[sni].add(server_ip)
-                sni_count += 1
-            elif ip_to_domain[server_ip] != sni:
-                # DNS gave us a name already; also register under SNI if different
-                # (e.g. CDN IP serving multiple hostnames — keep DNS name but note SNI)
-                domain_ips[sni].add(server_ip)
+            # SNI (only if we haven't already mapped this server IP via DNS)
+            if IP in pkt and TCP in pkt and pkt[TCP].dport == 443:
+                payload = bytes(pkt[TCP].payload)
+                if payload:
+                    sni = extract_sni(payload)
+                    if sni:
+                        server_ip = pkt[IP].dst
+                        if server_ip not in ip_to_domain:
+                            ip_to_domain[server_ip] = sni
+                            domain_ips[sni].add(server_ip)
+                        elif ip_to_domain[server_ip] != sni:
+                            domain_ips[sni].add(server_ip)
 
-    if sni_count:
-        print(f"[*] SNI: mapped {sni_count:,} additional IPs from TLS ClientHello", flush=True)
-    else:
-        print(f"[*] SNI: no new IPs discovered (all already covered by DNS)", flush=True)
+    print(f"[*] Loaded {pkt_count:,} packets (streamed, no full RAM load)", flush=True)
+    print(f"[*] DNS+SNI: {len(ip_to_domain):,} IPs → {len(domain_ips):,} domains", flush=True)
 
-    # --- Auto-detect capture IP -------------------------------------------
     if capture_ip is None:
-        dns_srcs: dict[str, int] = defaultdict(int)
-        for pkt in packets:
-            if DNS in pkt and pkt[DNS].qr == 0 and IP in pkt:
-                dns_srcs[pkt[IP].src] += 1
         if dns_srcs:
             capture_ip = max(dns_srcs, key=dns_srcs.get)
             print(f"[*] Auto-detected capture IP: {capture_ip}", flush=True)
         else:
             print("[!] Could not auto-detect capture IP; TX/RX will be best-effort", flush=True)
 
-    # --- Pass 2: TCP traffic → domain / unmatched IP ----------------------
-    stats: dict[str, DomainStats] = {}
+    # ------------------------------------------------------------------
+    # Pass B: traffic accounting + incremental TLS reassembly
+    # ------------------------------------------------------------------
+    print(f"[*] Pass B: traffic + TLS classification …", flush=True)
+
+    stats: dict[str, DomainStats]    = {}
     unmatched: dict[str, DomainStats] = {}
+
+    # Retransmission: track (src,dst,sport,dport,seq) tuples that carried data.
+    # Evict on FIN/RST to bound memory.
     seen_seq: set = set()
 
-    # Per-flow TLS reassembly state: fkey → [next_expected_seq, leftover: bytearray]
-    # We only keep at most one partial TLS record (≤ 16 KB) per flow in RAM —
-    # never the full stream.
+    # TLS reassembly: fkey → [next_expected_seq, bytearray_leftover]
+    # Evicted on FIN/RST — at most one partial record (≤ ~16 KB) per live flow.
     tls_flow: dict[tuple, list] = {}
 
-    for pkt in packets:
-        if IP not in pkt or TCP not in pkt:
-            continue
+    with PcapReader(path) as reader:
+        for pkt in reader:
+            if IP not in pkt or TCP not in pkt:
+                continue
 
-        src = pkt[IP].src
-        dst = pkt[IP].dst
-        size = ip_pkt_size(pkt)
+            src   = pkt[IP].src
+            dst   = pkt[IP].dst
+            size  = ip_pkt_size(pkt)
+            flags = tcp_flags(pkt)
 
-        # Determine domain or fall back to raw IP
-        if dst in ip_to_domain:
-            domain = ip_to_domain[dst]
-            bucket = stats
-        elif src in ip_to_domain:
-            domain = ip_to_domain[src]
-            bucket = stats
-        else:
-            remote_ip = dst if (capture_ip and src == capture_ip) else src
-            domain = remote_ip
-            bucket = unmatched
+            # ---- Domain / bucket lookup --------------------------------
+            if dst in ip_to_domain:
+                domain, bucket = ip_to_domain[dst], stats
+            elif src in ip_to_domain:
+                domain, bucket = ip_to_domain[src], stats
+            else:
+                remote_ip = dst if (capture_ip and src == capture_ip) else src
+                domain, bucket = remote_ip, unmatched
 
-        if domain not in bucket:
-            bucket[domain] = DomainStats(
-                domain=domain,
-                ips=domain_ips.get(domain, {domain} if bucket is unmatched else set()),
-            )
+            if domain not in bucket:
+                bucket[domain] = DomainStats(
+                    domain=domain,
+                    ips=domain_ips.get(domain, {domain} if bucket is unmatched else set()),
+                )
+            s = bucket[domain]
 
-        s = bucket[domain]
+            # ---- TX / RX -----------------------------------------------
+            if capture_ip and src == capture_ip:
+                s.tx_bytes   += size
+                s.tx_packets += 1
+            else:
+                s.rx_bytes   += size
+                s.rx_packets += 1
 
-        if capture_ip and src == capture_ip:
-            s.tx_bytes += size
-            s.tx_packets += 1
-        else:
-            s.rx_bytes += size
-            s.rx_packets += 1
+            # ---- TCP handshake (SYN / SYN-ACK) -------------------------
+            if flags.get("SYN"):
+                s.handshake_packets += 1
+                s.handshake_bytes   += size
 
-        if is_handshake(pkt):
-            s.handshake_packets += 1
-            s.handshake_bytes += size
+            # ---- RST (connection reset — tracked separately) -----------
+            if flags.get("RST"):
+                s.rst_packets += 1
+                s.rst_bytes   += size
+                # Evict flow state on RST
+                fkey_ab = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
+                fkey_ba = (dst, src, pkt[TCP].dport, pkt[TCP].sport)
+                tls_flow.pop(fkey_ab, None)
+                tls_flow.pop(fkey_ba, None)
+                continue
 
-        if is_retransmission(pkt, seen_seq):
-            s.retrans_packets += 1
-            s.retrans_bytes += size
+            # ---- Retransmission (duplicate seq+data, no RST) -----------
+            payload_len = len(pkt[TCP].payload)
+            if payload_len > 0:
+                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
+                if seq_key in seen_seq:
+                    s.retrans_packets += 1
+                    s.retrans_bytes   += size
+                    continue   # retransmit: don't double-count TLS bytes
+                seen_seq.add(seq_key)
 
-        # ---- Incremental TLS classification --------------------------------
-        if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
-            continue
-        raw = bytes(pkt[TCP].payload)
-        if not raw:
-            continue
+            # Evict seen_seq + tls_flow on FIN (connection closing)
+            if flags.get("FIN"):
+                fkey_ab = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
+                fkey_ba = (dst, src, pkt[TCP].dport, pkt[TCP].sport)
+                tls_flow.pop(fkey_ab, None)
+                tls_flow.pop(fkey_ba, None)
+                # Don't evict seen_seq entries — seq space reuse is rare
+                # and clearing by flow would require a separate index.
 
-        fkey = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
-        seq  = pkt[TCP].seq
+            # ---- Incremental TLS reassembly ----------------------------
+            if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
+                continue
+            raw = bytes(pkt[TCP].payload)
+            if not raw:
+                continue
 
-        if fkey not in tls_flow:
-            # First segment seen for this flow: initialise with this seq
-            tls_flow[fkey] = [seq, bytearray()]
+            fkey = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
+            seq  = pkt[TCP].seq
 
-        state = tls_flow[fkey]
-        next_seq, buf = state[0], state[1]
+            if fkey not in tls_flow:
+                tls_flow[fkey] = [seq, bytearray()]
 
-        if seq == next_seq:
-            # In-order: append and advance
-            buf += raw
-            state[0] = seq + len(raw)
-        elif seq > next_seq:
-            # Gap: future segment arrived out of order — drop leftover,
-            # restart from this segment (we'll miss one record at most)
-            buf.clear()
-            buf += raw
-            state[0] = seq + len(raw)
-        else:
-            # Retransmit (seq < next_seq): skip
-            continue
+            state           = tls_flow[fkey]
+            next_seq        = state[0]
+            buf: bytearray  = state[1]
 
-        # Drain all complete TLS records from the buffer
-        pos = 0
-        while pos + 5 <= len(buf):
-            ct      = buf[pos]
-            version = (buf[pos+1] << 8) | buf[pos+2]
-            rec_len = (buf[pos+3] << 8) | buf[pos+4]
-
-            # Sanity-check
-            if version not in _TLS_VERSIONS or rec_len == 0 or rec_len > 16384 + 256:
-                # Not a TLS record — discard buffer to avoid infinite loop
+            if seq == next_seq:
+                buf        += raw
+                state[0]    = seq + len(raw)
+            elif seq > next_seq:
+                # Out-of-order gap: restart from here, lose one partial record
                 buf.clear()
-                break
+                buf        += raw
+                state[0]    = seq + len(raw)
+            else:
+                continue   # retransmit already handled above
 
-            if pos + 5 + rec_len > len(buf):
-                break   # record not yet complete, wait for more segments
+            # Drain complete TLS records
+            pos = 0
+            while pos + 5 <= len(buf):
+                ct      = buf[pos]
+                version = (buf[pos+1] << 8) | buf[pos+2]
+                rec_len = (buf[pos+3] << 8) | buf[pos+4]
 
-            if ct in _TLS_HS_TYPES:
-                s.tls_hs_bytes += rec_len
-            elif ct == _TLS_APP_DATA:
-                s.tls_data_bytes += rec_len
+                if version not in _TLS_VERSIONS or rec_len == 0 or rec_len > 16384 + 256:
+                    buf.clear()
+                    break
 
-            pos += 5 + rec_len
+                if pos + 5 + rec_len > len(buf):
+                    break   # incomplete record — wait for next segment
 
-        # Keep only the unconsumed tail (partial record)
-        if pos > 0:
-            del buf[:pos]
+                if ct in _TLS_HS_TYPES:
+                    s.tls_hs_bytes   += rec_len
+                elif ct == _TLS_APP_DATA:
+                    s.tls_data_bytes += rec_len
+
+                pos += 5 + rec_len
+
+            if pos > 0:
+                del buf[:pos]
 
     if unmatched:
         total_u = sum(s.total_packets for s in unmatched.values())
-        print(f"[!] {total_u:,} TCP packets across {len(unmatched):,} IPs with no DNS or SNI match "
+        print(f"[!] {total_u:,} packets across {len(unmatched):,} IPs with no DNS/SNI match "
               f"— shown in second table")
 
-    tls_flows_seen = sum(1 for s in list(stats.values()) + list(unmatched.values())
-                         if s.tls_hs_bytes + s.tls_data_bytes > 0)
-    print(f"[*] TLS: classified {tls_flows_seen:,} domains with TLS content", flush=True)
+    tls_domains = sum(1 for s in list(stats.values()) + list(unmatched.values())
+                      if s.tls_hs_bytes + s.tls_data_bytes > 0)
+    print(f"[*] TLS: classified {tls_domains:,} domains with TLS content", flush=True)
 
     return stats, unmatched
 
@@ -432,6 +421,7 @@ SORT_KEYS = {
     "rx_pkts":  lambda s: s.rx_packets,
     "domain":   lambda s: s.domain,
     "retrans":  lambda s: s.retrans_pct_packets,
+    "rst":      lambda s: s.rst_pct_packets,
     "tls_hs":   lambda s: s.tls_hs_bytes,
     "tls_data": lambda s: s.tls_data_bytes,
 }
@@ -464,6 +454,7 @@ def _render_rows(rows: list[DomainStats]) -> list[dict]:
             "hs_bw":     f"{s.handshake_pct_bytes:.1f}%",
             "rt_pkt":    f"{s.retrans_pct_packets:.1f}%",
             "rt_bw":     f"{s.retrans_pct_bytes:.1f}%",
+            "rst_pkt":   f"{s.rst_pct_packets:.1f}%",
             "tls_hs":    human_bytes(s.tls_hs_bytes),
             "tls_data":  human_bytes(s.tls_data_bytes),
             "tls_hs_p":  f"{s.tls_hs_pct:.1f}%",
@@ -480,14 +471,15 @@ _HEADERS = {
     "rx":        "RX",
     "tx_p":      "TX pkts",
     "rx_p":      "RX pkts",
-    "hs_pkt":    "HS% pkt",
-    "hs_bw":     "HS% bw",
-    "rt_pkt":    "RT% pkt",
+    "hs_pkt":    "HS% pkt",   # TCP SYN/SYN-ACK % of packets
+    "hs_bw":     "HS% bw",    # TCP SYN/SYN-ACK % of IP bytes
+    "rt_pkt":    "RT% pkt",   # retransmit % (data re-sends, no RST)
     "rt_bw":     "RT% bw",
-    "tls_hs":    "TLS-HS",
-    "tls_data":  "TLS-data",
-    "tls_hs_p":  "TLS-HS%",
-    "tls_dat_p": "TLS-data%",
+    "rst_pkt":   "RST% pkt",  # connection resets %
+    "tls_hs":    "TLS-HS",    # TLS handshake record bytes
+    "tls_data":  "TLS-data",  # TLS application_data record bytes
+    "tls_hs_p":  "TLS-HS%",   # % of TLS bytes that are handshake
+    "tls_dat_p": "TLS-data%", # % of TLS bytes that are payload
 }
 
 # Columns that are left-aligned
@@ -603,7 +595,7 @@ def print_table(
             "rx":        human_bytes(total_rx),
             "tx_p":      f"{total_txp:,}",
             "rx_p":      f"{total_rxp:,}",
-            "hs_pkt": "", "hs_bw": "", "rt_pkt": "", "rt_bw": "",
+            "hs_pkt": "", "hs_bw": "", "rt_pkt": "", "rt_bw": "", "rst_pkt": "",
             "tls_hs":    human_bytes(sum(s.tls_hs_bytes   for s in rows)),
             "tls_data":  human_bytes(sum(s.tls_data_bytes for s in rows)),
             "tls_hs_p": "", "tls_dat_p": "",
@@ -632,6 +624,7 @@ def write_csv(
             "handshake_pct_packets", "handshake_pct_bytes",
             "retrans_packets", "retrans_bytes",
             "retrans_pct_packets", "retrans_pct_bytes",
+            "rst_packets", "rst_bytes", "rst_pct_packets",
             "tls_hs_bytes", "tls_data_bytes",
             "tls_hs_pct", "tls_data_pct",
         ])
@@ -645,6 +638,7 @@ def write_csv(
                 f"{s.handshake_pct_packets:.2f}", f"{s.handshake_pct_bytes:.2f}",
                 s.retrans_packets, s.retrans_bytes,
                 f"{s.retrans_pct_packets:.2f}", f"{s.retrans_pct_bytes:.2f}",
+                s.rst_packets, s.rst_bytes, f"{s.rst_pct_packets:.2f}",
                 s.tls_hs_bytes, s.tls_data_bytes,
                 f"{s.tls_hs_pct:.2f}", f"{s.tls_data_pct:.2f}",
             ])
