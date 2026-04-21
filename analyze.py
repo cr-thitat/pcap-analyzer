@@ -48,6 +48,10 @@ class DomainStats:
     retrans_packets: int = 0
     retrans_bytes: int = 0
 
+    # TLS-layer breakdown (payload bytes only, not IP framing)
+    tls_hs_bytes: int = 0       # Handshake + ChangeCipherSpec + Alert records
+    tls_data_bytes: int = 0     # ApplicationData records (real encrypted payload)
+
     @property
     def total_packets(self):
         return self.tx_packets + self.rx_packets
@@ -71,6 +75,16 @@ class DomainStats:
     @property
     def retrans_pct_bytes(self):
         return 100.0 * self.retrans_bytes / self.total_bytes if self.total_bytes else 0.0
+
+    @property
+    def tls_hs_pct(self):
+        total_tls = self.tls_hs_bytes + self.tls_data_bytes
+        return 100.0 * self.tls_hs_bytes / total_tls if total_tls else 0.0
+
+    @property
+    def tls_data_pct(self):
+        total_tls = self.tls_hs_bytes + self.tls_data_bytes
+        return 100.0 * self.tls_data_bytes / total_tls if total_tls else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +204,17 @@ def extract_sni(payload: bytes) -> Optional[str]:
     return None
 
 
+# TLS content types
+_TLS_CHANGE_CIPHER = 0x14
+_TLS_ALERT         = 0x15
+_TLS_HANDSHAKE     = 0x16
+_TLS_APP_DATA      = 0x17
+
+_TLS_HS_TYPES  = {_TLS_CHANGE_CIPHER, _TLS_ALERT, _TLS_HANDSHAKE}
+_TLS_VERSIONS  = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}   # SSLv3 + TLS 1.0–1.3
+
+
+
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
@@ -274,8 +299,13 @@ def analyze_pcap(
 
     # --- Pass 2: TCP traffic → domain / unmatched IP ----------------------
     stats: dict[str, DomainStats] = {}
-    unmatched: dict[str, DomainStats] = {}   # keyed by remote IP
+    unmatched: dict[str, DomainStats] = {}
     seen_seq: set = set()
+
+    # Per-flow TLS reassembly state: fkey → [next_expected_seq, leftover: bytearray]
+    # We only keep at most one partial TLS record (≤ 16 KB) per flow in RAM —
+    # never the full stream.
+    tls_flow: dict[tuple, list] = {}
 
     for pkt in packets:
         if IP not in pkt or TCP not in pkt:
@@ -293,7 +323,6 @@ def analyze_pcap(
             domain = ip_to_domain[src]
             bucket = stats
         else:
-            # Unmatched: use the remote IP as the key
             remote_ip = dst if (capture_ip and src == capture_ip) else src
             domain = remote_ip
             bucket = unmatched
@@ -321,10 +350,72 @@ def analyze_pcap(
             s.retrans_packets += 1
             s.retrans_bytes += size
 
+        # ---- Incremental TLS classification --------------------------------
+        if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
+            continue
+        raw = bytes(pkt[TCP].payload)
+        if not raw:
+            continue
+
+        fkey = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
+        seq  = pkt[TCP].seq
+
+        if fkey not in tls_flow:
+            # First segment seen for this flow: initialise with this seq
+            tls_flow[fkey] = [seq, bytearray()]
+
+        state = tls_flow[fkey]
+        next_seq, buf = state[0], state[1]
+
+        if seq == next_seq:
+            # In-order: append and advance
+            buf += raw
+            state[0] = seq + len(raw)
+        elif seq > next_seq:
+            # Gap: future segment arrived out of order — drop leftover,
+            # restart from this segment (we'll miss one record at most)
+            buf.clear()
+            buf += raw
+            state[0] = seq + len(raw)
+        else:
+            # Retransmit (seq < next_seq): skip
+            continue
+
+        # Drain all complete TLS records from the buffer
+        pos = 0
+        while pos + 5 <= len(buf):
+            ct      = buf[pos]
+            version = (buf[pos+1] << 8) | buf[pos+2]
+            rec_len = (buf[pos+3] << 8) | buf[pos+4]
+
+            # Sanity-check
+            if version not in _TLS_VERSIONS or rec_len == 0 or rec_len > 16384 + 256:
+                # Not a TLS record — discard buffer to avoid infinite loop
+                buf.clear()
+                break
+
+            if pos + 5 + rec_len > len(buf):
+                break   # record not yet complete, wait for more segments
+
+            if ct in _TLS_HS_TYPES:
+                s.tls_hs_bytes += rec_len
+            elif ct == _TLS_APP_DATA:
+                s.tls_data_bytes += rec_len
+
+            pos += 5 + rec_len
+
+        # Keep only the unconsumed tail (partial record)
+        if pos > 0:
+            del buf[:pos]
+
     if unmatched:
         total_u = sum(s.total_packets for s in unmatched.values())
         print(f"[!] {total_u:,} TCP packets across {len(unmatched):,} IPs with no DNS or SNI match "
               f"— shown in second table")
+
+    tls_flows_seen = sum(1 for s in list(stats.values()) + list(unmatched.values())
+                         if s.tls_hs_bytes + s.tls_data_bytes > 0)
+    print(f"[*] TLS: classified {tls_flows_seen:,} domains with TLS content", flush=True)
 
     return stats, unmatched
 
@@ -334,13 +425,15 @@ def analyze_pcap(
 # ---------------------------------------------------------------------------
 
 SORT_KEYS = {
-    "tx":      lambda s: s.tx_bytes,
-    "rx":      lambda s: s.rx_bytes,
-    "total":   lambda s: s.total_bytes,
-    "tx_pkts": lambda s: s.tx_packets,
-    "rx_pkts": lambda s: s.rx_packets,
-    "domain":  lambda s: s.domain,
-    "retrans": lambda s: s.retrans_pct_packets,
+    "tx":       lambda s: s.tx_bytes,
+    "rx":       lambda s: s.rx_bytes,
+    "total":    lambda s: s.total_bytes,
+    "tx_pkts":  lambda s: s.tx_packets,
+    "rx_pkts":  lambda s: s.rx_packets,
+    "domain":   lambda s: s.domain,
+    "retrans":  lambda s: s.retrans_pct_packets,
+    "tls_hs":   lambda s: s.tls_hs_bytes,
+    "tls_data": lambda s: s.tls_data_bytes,
 }
 
 
@@ -361,32 +454,40 @@ def _render_rows(rows: list[DomainStats]) -> list[dict]:
     for s in rows:
         sorted_ips = sorted(s.ips)
         out.append({
-            "domain":   s.domain,
-            "ips":      _chunk_ips(sorted_ips),   # list[str], one entry per printed line
-            "tx":       human_bytes(s.tx_bytes),
-            "rx":       human_bytes(s.rx_bytes),
-            "tx_p":     f"{s.tx_packets:,}",
-            "rx_p":     f"{s.rx_packets:,}",
-            "hs_pkt":   f"{s.handshake_pct_packets:.1f}%",
-            "hs_bw":    f"{s.handshake_pct_bytes:.1f}%",
-            "rt_pkt":   f"{s.retrans_pct_packets:.1f}%",
-            "rt_bw":    f"{s.retrans_pct_bytes:.1f}%",
+            "domain":    s.domain,
+            "ips":       _chunk_ips(sorted_ips),
+            "tx":        human_bytes(s.tx_bytes),
+            "rx":        human_bytes(s.rx_bytes),
+            "tx_p":      f"{s.tx_packets:,}",
+            "rx_p":      f"{s.rx_packets:,}",
+            "hs_pkt":    f"{s.handshake_pct_packets:.1f}%",
+            "hs_bw":     f"{s.handshake_pct_bytes:.1f}%",
+            "rt_pkt":    f"{s.retrans_pct_packets:.1f}%",
+            "rt_bw":     f"{s.retrans_pct_bytes:.1f}%",
+            "tls_hs":    human_bytes(s.tls_hs_bytes),
+            "tls_data":  human_bytes(s.tls_data_bytes),
+            "tls_hs_p":  f"{s.tls_hs_pct:.1f}%",
+            "tls_dat_p": f"{s.tls_data_pct:.1f}%",
         })
     return out
 
 
 # Fixed column headers (same order as render keys)
 _HEADERS = {
-    "domain": "Domain",
-    "ips":    "IPs",
-    "tx":     "TX",
-    "rx":     "RX",
-    "tx_p":   "TX pkts",
-    "rx_p":   "RX pkts",
-    "hs_pkt": "HS% pkt",
-    "hs_bw":  "HS% bw",
-    "rt_pkt": "RT% pkt",
-    "rt_bw":  "RT% bw",
+    "domain":    "Domain",
+    "ips":       "IPs",
+    "tx":        "TX",
+    "rx":        "RX",
+    "tx_p":      "TX pkts",
+    "rx_p":      "RX pkts",
+    "hs_pkt":    "HS% pkt",
+    "hs_bw":     "HS% bw",
+    "rt_pkt":    "RT% pkt",
+    "rt_bw":     "RT% bw",
+    "tls_hs":    "TLS-HS",
+    "tls_data":  "TLS-data",
+    "tls_hs_p":  "TLS-HS%",
+    "tls_dat_p": "TLS-data%",
 }
 
 # Columns that are left-aligned
@@ -496,13 +597,16 @@ def print_table(
         total_txp = sum(s.tx_packets for s in rows)
         total_rxp = sum(s.rx_packets for s in rows)
         totals = {
-            "domain": "TOTAL",
-            "ips":    "",
-            "tx":     human_bytes(total_tx),
-            "rx":     human_bytes(total_rx),
-            "tx_p":   f"{total_txp:,}",
-            "rx_p":   f"{total_rxp:,}",
+            "domain":    "TOTAL",
+            "ips":       "",
+            "tx":        human_bytes(total_tx),
+            "rx":        human_bytes(total_rx),
+            "tx_p":      f"{total_txp:,}",
+            "rx_p":      f"{total_rxp:,}",
             "hs_pkt": "", "hs_bw": "", "rt_pkt": "", "rt_bw": "",
+            "tls_hs":    human_bytes(sum(s.tls_hs_bytes   for s in rows)),
+            "tls_data":  human_bytes(sum(s.tls_data_bytes for s in rows)),
+            "tls_hs_p": "", "tls_dat_p": "",
         }
 
         _print_table_from_rows(rendered, totals, label, sort_by, len(rows))
@@ -528,6 +632,8 @@ def write_csv(
             "handshake_pct_packets", "handshake_pct_bytes",
             "retrans_packets", "retrans_bytes",
             "retrans_pct_packets", "retrans_pct_bytes",
+            "tls_hs_bytes", "tls_data_bytes",
+            "tls_hs_pct", "tls_data_pct",
         ])
         for s in all_rows:
             resolved = s.domain not in unmatched
@@ -539,6 +645,8 @@ def write_csv(
                 f"{s.handshake_pct_packets:.2f}", f"{s.handshake_pct_bytes:.2f}",
                 s.retrans_packets, s.retrans_bytes,
                 f"{s.retrans_pct_packets:.2f}", f"{s.retrans_pct_bytes:.2f}",
+                s.tls_hs_bytes, s.tls_data_bytes,
+                f"{s.tls_hs_pct:.2f}", f"{s.tls_data_pct:.2f}",
             ])
     print(f"[*] CSV written to {path}")
 
