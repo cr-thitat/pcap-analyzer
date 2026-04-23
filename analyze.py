@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 pcap_bandwidth_analyzer.py
-Analyze bandwidth per domain from a pcap captured with:
+Analyze payload vs overhead bandwidth per domain from a pcap captured with:
     tcp port 443 || port 53
+
+  Payload  = TLS ApplicationData record bodies (encrypted content)
+  Overhead = everything else: TCP/IP headers, bare ACKs, TCP+TLS handshakes,
+             retransmits, RSTs, TLS record framing headers
 
 Usage:
     python3 pcap_bandwidth_analyzer.py capture.pcap
-    python3 pcap_bandwidth_analyzer.py capture.pcap --sort tx
+    python3 pcap_bandwidth_analyzer.py capture.pcap --sort overhead
     python3 pcap_bandwidth_analyzer.py capture.pcap --min-bytes 1024
-    python3 pcap_bandwidth_analyzer.py capture.pcap --csv out.csv
+    python3 pcap_bandwidth_analyzer.py capture.pcap --capture-ip 192.168.1.5
 
 Requirements:
     pip install scapy
@@ -16,14 +20,12 @@ Requirements:
 
 import argparse
 import sys
-import csv
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
 try:
-    from scapy.all import PcapReader, IP, TCP, UDP, DNS, DNSRR, DNSQR
-    from scapy.layers.dns import DNSRR
+    from scapy.all import PcapReader, IP, TCP, DNS
 except ImportError:
     print("Error: scapy is required. Install with: pip install scapy")
     sys.exit(1)
@@ -43,23 +45,8 @@ class DomainStats:
     tx_packets: int = 0
     rx_packets: int = 0
 
-    # TCP 3-way handshake (SYN / SYN-ACK packets only)
-    # Bytes = IP-level packet size, same basis as tx_bytes/rx_bytes
-    handshake_packets: int = 0
-    handshake_bytes: int = 0
-
-    # Retransmissions: duplicate seq+payload (re-sent data)
-    retrans_packets: int = 0
-    retrans_bytes: int = 0
-
-    # Connection resets (RST flag) — separate from retransmissions
-    rst_packets: int = 0
-    rst_bytes: int = 0
-
-    # TLS-layer breakdown — record *body* bytes (excludes 5-byte TLS record headers
-    # and all TCP/IP framing), so tls_hs_bytes + tls_data_bytes < total_bytes.
-    tls_hs_bytes: int = 0       # Handshake + ChangeCipherSpec + Alert records
-    tls_data_bytes: int = 0     # ApplicationData records (encrypted payload)
+    # TLS ApplicationData record bodies only (the actual encrypted content)
+    tls_data_bytes: int = 0
 
     @property
     def total_packets(self):
@@ -69,39 +56,23 @@ class DomainStats:
     def total_bytes(self):
         return self.tx_bytes + self.rx_bytes
 
-    # --- TCP handshake % (both relative to IP-level totals) ---
     @property
-    def handshake_pct_packets(self):
-        return 100.0 * self.handshake_packets / self.total_packets if self.total_packets else 0.0
+    def payload_bytes(self):
+        """TLS ApplicationData bytes — the actual useful content."""
+        return self.tls_data_bytes
 
     @property
-    def handshake_pct_bytes(self):
-        return 100.0 * self.handshake_bytes / self.total_bytes if self.total_bytes else 0.0
-
-    # --- Retransmission % (IP-level, re-sent data only, excludes RST) ---
-    @property
-    def retrans_pct_packets(self):
-        return 100.0 * self.retrans_packets / self.total_packets if self.total_packets else 0.0
+    def overhead_bytes(self):
+        """Everything that isn't payload: headers, handshakes, ACKs, retransmits…"""
+        return self.total_bytes - self.tls_data_bytes
 
     @property
-    def retrans_pct_bytes(self):
-        return 100.0 * self.retrans_bytes / self.total_bytes if self.total_bytes else 0.0
-
-    # --- RST % ---
-    @property
-    def rst_pct_packets(self):
-        return 100.0 * self.rst_packets / self.total_packets if self.total_packets else 0.0
-
-    # --- TLS split % (relative to TLS record bytes only, not IP-level) ---
-    @property
-    def tls_hs_pct(self):
-        total_tls = self.tls_hs_bytes + self.tls_data_bytes
-        return 100.0 * self.tls_hs_bytes / total_tls if total_tls else 0.0
+    def payload_pct(self):
+        return 100.0 * self.payload_bytes / self.total_bytes if self.total_bytes else 0.0
 
     @property
-    def tls_data_pct(self):
-        total_tls = self.tls_hs_bytes + self.tls_data_bytes
-        return 100.0 * self.tls_data_bytes / total_tls if total_tls else 0.0
+    def overhead_pct(self):
+        return 100.0 * self.overhead_bytes / self.total_bytes if self.total_bytes else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +88,7 @@ def human_bytes(n: int) -> str:
 
 
 def ip_pkt_size(pkt) -> int:
-    if IP in pkt:
-        return pkt[IP].len
-    return len(pkt)
+    return pkt[IP].len if IP in pkt else len(pkt)
 
 
 def tcp_flags(pkt) -> dict:
@@ -128,28 +97,14 @@ def tcp_flags(pkt) -> dict:
     f = pkt[TCP].flags
     return {
         "SYN": bool(f & 0x02),
-        "ACK": bool(f & 0x10),
         "FIN": bool(f & 0x01),
         "RST": bool(f & 0x04),
-        "PSH": bool(f & 0x08),
     }
 
 
-def is_handshake(pkt) -> bool:
-    """SYN or SYN-ACK — TCP 3-way handshake packets only."""
-    if TCP not in pkt:
-        return False
-    return tcp_flags(pkt).get("SYN", False)
-
-
 def extract_sni(payload: bytes) -> Optional[str]:
-    """
-    Parse a TLS ClientHello and return the SNI hostname, or None.
-    """
     try:
-        if len(payload) < 5:
-            return None
-        if payload[0] != 0x16:
+        if len(payload) < 5 or payload[0] != 0x16:
             return None
         record_len = int.from_bytes(payload[3:5], "big")
         if len(payload) < 5 + record_len:
@@ -157,10 +112,10 @@ def extract_sni(payload: bytes) -> Optional[str]:
         hs = payload[5:5 + record_len]
         if hs[0] != 0x01:
             return None
-        pos = 1 + 3 + 2 + 32   # type + length + version + random
+        pos = 1 + 3 + 2 + 32
         sid_len = hs[pos]; pos += 1 + sid_len
-        cs_len = int.from_bytes(hs[pos:pos+2], "big"); pos += 2 + cs_len
-        cm_len = hs[pos]; pos += 1 + cm_len
+        cs_len  = int.from_bytes(hs[pos:pos+2], "big"); pos += 2 + cs_len
+        cm_len  = hs[pos]; pos += 1 + cm_len
         if pos + 2 > len(hs):
             return None
         ext_total = int.from_bytes(hs[pos:pos+2], "big"); pos += 2
@@ -169,7 +124,7 @@ def extract_sni(payload: bytes) -> Optional[str]:
             ext_type = int.from_bytes(hs[pos:pos+2], "big")
             ext_len  = int.from_bytes(hs[pos+2:pos+4], "big")
             pos += 4
-            if ext_type == 0x0000:  # SNI
+            if ext_type == 0x0000:
                 if ext_len < 5:
                     return None
                 name_len = int.from_bytes(hs[pos+3:pos+5], "big")
@@ -180,18 +135,12 @@ def extract_sni(payload: bytes) -> Optional[str]:
     return None
 
 
-# TLS content types
-_TLS_CHANGE_CIPHER = 0x14
-_TLS_ALERT         = 0x15
-_TLS_HANDSHAKE     = 0x16
-_TLS_APP_DATA      = 0x17
-
-_TLS_HS_TYPES = {_TLS_CHANGE_CIPHER, _TLS_ALERT, _TLS_HANDSHAKE}
+_TLS_APP_DATA = 0x17
 _TLS_VERSIONS = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}
 
 
 # ---------------------------------------------------------------------------
-# Core analysis — two-pass streaming (no rdpcap, no full RAM load)
+# Core analysis — two-pass streaming
 # ---------------------------------------------------------------------------
 
 def analyze_pcap(
@@ -199,26 +148,25 @@ def analyze_pcap(
     capture_ip: Optional[str] = None,
 ) -> tuple[dict[str, DomainStats], dict[str, DomainStats]]:
     """
-    Pass A: stream once to build DNS+SNI maps and auto-detect capture IP.
-    Pass B: stream again for traffic accounting + TLS reassembly.
-    Peak RAM: O(flows) not O(packets).
+    Pass A: DNS + SNI resolution, capture-IP detection.
+    Pass B: per-packet accounting + incremental TLS reassembly.
+    Peak RAM: O(live flows), not O(all packets).
     """
 
     # ------------------------------------------------------------------
-    # Pass A: DNS answers → ip_to_domain, SNI → ip_to_domain, capture IP
+    # Pass A
     # ------------------------------------------------------------------
-    print(f"[*] Pass A: DNS + SNI + capture-IP detection …", flush=True)
+    print("[*] Pass A: DNS + SNI + capture-IP …", flush=True)
 
     ip_to_domain: dict[str, str] = {}
-    domain_ips: dict[str, set]   = defaultdict(set)
-    dns_srcs: dict[str, int]     = defaultdict(int)
+    domain_ips:   dict[str, set] = defaultdict(set)
+    dns_srcs:     dict[str, int] = defaultdict(int)
     pkt_count = 0
 
     with PcapReader(path) as reader:
         for pkt in reader:
             pkt_count += 1
 
-            # DNS
             if DNS in pkt:
                 dns = pkt[DNS]
                 if dns.qr == 1 and dns.ancount > 0:
@@ -237,11 +185,10 @@ def analyze_pcap(
                 if dns.qr == 0 and IP in pkt:
                     dns_srcs[pkt[IP].src] += 1
 
-            # SNI (only if we haven't already mapped this server IP via DNS)
             if IP in pkt and TCP in pkt and pkt[TCP].dport == 443:
-                payload = bytes(pkt[TCP].payload)
-                if payload:
-                    sni = extract_sni(payload)
+                raw = bytes(pkt[TCP].payload)
+                if raw:
+                    sni = extract_sni(raw)
                     if sni:
                         server_ip = pkt[IP].dst
                         if server_ip not in ip_to_domain:
@@ -250,30 +197,27 @@ def analyze_pcap(
                         elif ip_to_domain[server_ip] != sni:
                             domain_ips[sni].add(server_ip)
 
-    print(f"[*] Loaded {pkt_count:,} packets (streamed, no full RAM load)", flush=True)
-    print(f"[*] DNS+SNI: {len(ip_to_domain):,} IPs → {len(domain_ips):,} domains", flush=True)
+    print(f"[*] {pkt_count:,} packets | "
+          f"{len(ip_to_domain):,} IPs → {len(domain_ips):,} domains", flush=True)
 
     if capture_ip is None:
         if dns_srcs:
             capture_ip = max(dns_srcs, key=dns_srcs.get)
-            print(f"[*] Auto-detected capture IP: {capture_ip}", flush=True)
+            print(f"[*] Capture IP: {capture_ip}", flush=True)
         else:
-            print("[!] Could not auto-detect capture IP; TX/RX will be best-effort", flush=True)
+            print("[!] Could not auto-detect capture IP; TX/RX best-effort", flush=True)
 
     # ------------------------------------------------------------------
-    # Pass B: traffic accounting + incremental TLS reassembly
+    # Pass B
     # ------------------------------------------------------------------
-    print(f"[*] Pass B: traffic + TLS classification …", flush=True)
+    print("[*] Pass B: accounting + TLS reassembly …", flush=True)
 
-    stats: dict[str, DomainStats]    = {}
+    stats:     dict[str, DomainStats] = {}
     unmatched: dict[str, DomainStats] = {}
 
-    # Retransmission: track (src,dst,sport,dport,seq) tuples that carried data.
-    # Evict on FIN/RST to bound memory.
+    # (src,dst,sport,dport,seq) → retransmit guard; evicted on FIN/RST
     seen_seq: set = set()
-
-    # TLS reassembly: fkey → [next_expected_seq, bytearray_leftover]
-    # Evicted on FIN/RST — at most one partial record (≤ ~16 KB) per live flow.
+    # fkey → [next_expected_seq, bytearray leftover]; at most ~16 KB per live flow
     tls_flow: dict[tuple, list] = {}
 
     with PcapReader(path) as reader:
@@ -286,13 +230,13 @@ def analyze_pcap(
             size  = ip_pkt_size(pkt)
             flags = tcp_flags(pkt)
 
-            # ---- Domain / bucket lookup --------------------------------
+            # Domain lookup
             if dst in ip_to_domain:
                 domain, bucket = ip_to_domain[dst], stats
             elif src in ip_to_domain:
                 domain, bucket = ip_to_domain[src], stats
             else:
-                remote_ip = dst if (capture_ip and src == capture_ip) else src
+                remote_ip      = dst if (capture_ip and src == capture_ip) else src
                 domain, bucket = remote_ip, unmatched
 
             if domain not in bucket:
@@ -302,50 +246,33 @@ def analyze_pcap(
                 )
             s = bucket[domain]
 
-            # ---- TX / RX -----------------------------------------------
+            # TX / RX (IP-level bytes)
             if capture_ip and src == capture_ip:
-                s.tx_bytes   += size
-                s.tx_packets += 1
+                s.tx_bytes += size;  s.tx_packets += 1
             else:
-                s.rx_bytes   += size
-                s.rx_packets += 1
+                s.rx_bytes += size;  s.rx_packets += 1
 
-            # ---- TCP handshake (SYN / SYN-ACK) -------------------------
-            if flags.get("SYN"):
-                s.handshake_packets += 1
-                s.handshake_bytes   += size
-
-            # ---- RST (connection reset — tracked separately) -----------
+            # RST: evict flow state, skip TLS
             if flags.get("RST"):
-                s.rst_packets += 1
-                s.rst_bytes   += size
-                # Evict flow state on RST
-                fkey_ab = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
-                fkey_ba = (dst, src, pkt[TCP].dport, pkt[TCP].sport)
-                tls_flow.pop(fkey_ab, None)
-                tls_flow.pop(fkey_ba, None)
+                sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                tls_flow.pop((src, dst, sport, dport), None)
+                tls_flow.pop((dst, src, dport, sport), None)
                 continue
 
-            # ---- Retransmission (duplicate seq+data, no RST) -----------
-            payload_len = len(pkt[TCP].payload)
-            if payload_len > 0:
+            # Retransmission guard — skip duplicate segments for TLS accounting
+            if len(pkt[TCP].payload) > 0:
                 seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
                 if seq_key in seen_seq:
-                    s.retrans_packets += 1
-                    s.retrans_bytes   += size
-                    continue   # retransmit: don't double-count TLS bytes
+                    continue
                 seen_seq.add(seq_key)
 
-            # Evict seen_seq + tls_flow on FIN (connection closing)
+            # FIN: evict flow state
             if flags.get("FIN"):
-                fkey_ab = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
-                fkey_ba = (dst, src, pkt[TCP].dport, pkt[TCP].sport)
-                tls_flow.pop(fkey_ab, None)
-                tls_flow.pop(fkey_ba, None)
-                # Don't evict seen_seq entries — seq space reuse is rare
-                # and clearing by flow would require a separate index.
+                sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                tls_flow.pop((src, dst, sport, dport), None)
+                tls_flow.pop((dst, src, dport, sport), None)
 
-            # ---- Incremental TLS reassembly ----------------------------
+            # TLS reassembly (port 443 only)
             if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
                 continue
             raw = bytes(pkt[TCP].payload)
@@ -358,38 +285,31 @@ def analyze_pcap(
             if fkey not in tls_flow:
                 tls_flow[fkey] = [seq, bytearray()]
 
-            state           = tls_flow[fkey]
-            next_seq        = state[0]
-            buf: bytearray  = state[1]
+            state          = tls_flow[fkey]
+            next_seq       = state[0]
+            buf: bytearray = state[1]
 
             if seq == next_seq:
-                buf        += raw
-                state[0]    = seq + len(raw)
+                buf += raw;   state[0] = seq + len(raw)
             elif seq > next_seq:
-                # Out-of-order gap: restart from here, lose one partial record
-                buf.clear()
-                buf        += raw
-                state[0]    = seq + len(raw)
+                buf.clear();  buf += raw;  state[0] = seq + len(raw)
             else:
-                continue   # retransmit already handled above
+                continue   # already-seen retransmit
 
-            # Drain complete TLS records
+            # Drain complete TLS records, count only ApplicationData
             pos = 0
             while pos + 5 <= len(buf):
                 ct      = buf[pos]
                 version = (buf[pos+1] << 8) | buf[pos+2]
                 rec_len = (buf[pos+3] << 8) | buf[pos+4]
 
-                if version not in _TLS_VERSIONS or rec_len == 0 or rec_len > 16384 + 256:
-                    buf.clear()
-                    break
+                if version not in _TLS_VERSIONS or rec_len == 0 or rec_len > 16640:
+                    buf.clear(); break
 
                 if pos + 5 + rec_len > len(buf):
-                    break   # incomplete record — wait for next segment
+                    break   # incomplete — wait for next segment
 
-                if ct in _TLS_HS_TYPES:
-                    s.tls_hs_bytes   += rec_len
-                elif ct == _TLS_APP_DATA:
+                if ct == _TLS_APP_DATA:
                     s.tls_data_bytes += rec_len
 
                 pos += 5 + rec_len
@@ -399,12 +319,8 @@ def analyze_pcap(
 
     if unmatched:
         total_u = sum(s.total_packets for s in unmatched.values())
-        print(f"[!] {total_u:,} packets across {len(unmatched):,} IPs with no DNS/SNI match "
-              f"— shown in second table")
-
-    tls_domains = sum(1 for s in list(stats.values()) + list(unmatched.values())
-                      if s.tls_hs_bytes + s.tls_data_bytes > 0)
-    print(f"[*] TLS: classified {tls_domains:,} domains with TLS content", flush=True)
+        print(f"[!] {total_u:,} packets / {len(unmatched):,} IPs with no DNS/SNI — "
+              f"shown in second table")
 
     return stats, unmatched
 
@@ -420,80 +336,60 @@ SORT_KEYS = {
     "tx_pkts":  lambda s: s.tx_packets,
     "rx_pkts":  lambda s: s.rx_packets,
     "domain":   lambda s: s.domain,
-    "retrans":  lambda s: s.retrans_pct_packets,
-    "rst":      lambda s: s.rst_pct_packets,
-    "tls_hs":   lambda s: s.tls_hs_bytes,
-    "tls_data": lambda s: s.tls_data_bytes,
+    "payload":  lambda s: s.payload_bytes,
+    "overhead": lambda s: s.overhead_bytes,
+    "ovh_pct":  lambda s: s.overhead_pct,
 }
 
-
-IP_WRAP = 4  # max IPs per line before wrapping
-
+IP_WRAP = 4
 
 def _chunk_ips(ips: list[str]) -> list[str]:
-    """Split a sorted IP list into comma-joined chunks of IP_WRAP each."""
     chunks = []
     for i in range(0, max(1, len(ips)), IP_WRAP):
         chunks.append(", ".join(ips[i:i + IP_WRAP]))
     return chunks
 
 
+_HEADERS = {
+    "domain":   "Domain",
+    "ips":      "IPs",
+    "tx":       "TX",
+    "rx":       "RX",
+    "tx_p":     "TX pkts",
+    "rx_p":     "RX pkts",
+    "payload":  "Payload",    # TLS ApplicationData bytes
+    "overhead": "Overhead",   # total - payload
+    "pay_pct":  "Payload%",   # payload / total IP bytes
+    "ovh_pct":  "Overhead%",  # overhead / total IP bytes
+}
+
+_LEFT = {"domain", "ips"}
+
+
 def _render_rows(rows: list[DomainStats]) -> list[dict]:
-    """Pre-render every cell to a string (ips stored as list of line-chunks)."""
     out = []
     for s in rows:
-        sorted_ips = sorted(s.ips)
         out.append({
-            "domain":    s.domain,
-            "ips":       _chunk_ips(sorted_ips),
-            "tx":        human_bytes(s.tx_bytes),
-            "rx":        human_bytes(s.rx_bytes),
-            "tx_p":      f"{s.tx_packets:,}",
-            "rx_p":      f"{s.rx_packets:,}",
-            "hs_pkt":    f"{s.handshake_pct_packets:.1f}%",
-            "hs_bw":     f"{s.handshake_pct_bytes:.1f}%",
-            "rt_pkt":    f"{s.retrans_pct_packets:.1f}%",
-            "rt_bw":     f"{s.retrans_pct_bytes:.1f}%",
-            "rst_pkt":   f"{s.rst_pct_packets:.1f}%",
-            "tls_hs":    human_bytes(s.tls_hs_bytes),
-            "tls_data":  human_bytes(s.tls_data_bytes),
-            "tls_hs_p":  f"{s.tls_hs_pct:.1f}%",
-            "tls_dat_p": f"{s.tls_data_pct:.1f}%",
+            "domain":   s.domain,
+            "ips":      _chunk_ips(sorted(s.ips)),
+            "tx":       human_bytes(s.tx_bytes),
+            "rx":       human_bytes(s.rx_bytes),
+            "tx_p":     f"{s.tx_packets:,}",
+            "rx_p":     f"{s.rx_packets:,}",
+            "payload":  human_bytes(s.payload_bytes),
+            "overhead": human_bytes(s.overhead_bytes),
+            "pay_pct":  f"{s.payload_pct:.1f}%",
+            "ovh_pct":  f"{s.overhead_pct:.1f}%",
         })
     return out
 
 
-# Fixed column headers (same order as render keys)
-_HEADERS = {
-    "domain":    "Domain",
-    "ips":       "IPs",
-    "tx":        "TX",
-    "rx":        "RX",
-    "tx_p":      "TX pkts",
-    "rx_p":      "RX pkts",
-    "hs_pkt":    "HS% pkt",   # TCP SYN/SYN-ACK % of packets
-    "hs_bw":     "HS% bw",    # TCP SYN/SYN-ACK % of IP bytes
-    "rt_pkt":    "RT% pkt",   # retransmit % (data re-sends, no RST)
-    "rt_bw":     "RT% bw",
-    "rst_pkt":   "RST% pkt",  # connection resets %
-    "tls_hs":    "TLS-HS",    # TLS handshake record bytes
-    "tls_data":  "TLS-data",  # TLS application_data record bytes
-    "tls_hs_p":  "TLS-HS%",   # % of TLS bytes that are handshake
-    "tls_dat_p": "TLS-data%", # % of TLS bytes that are payload
-}
-
-# Columns that are left-aligned
-_LEFT = {"domain", "ips"}
-
-
 def _compute_widths(rendered: list[dict], totals_row: dict) -> dict[str, int]:
-    """Compute per-column widths = max(header, all data, totals row)."""
-    cols = list(_HEADERS.keys())
+    cols   = list(_HEADERS.keys())
     widths = {c: len(_HEADERS[c]) for c in cols}
     for row in rendered + [totals_row]:
         for c in cols:
             val = row.get(c, "")
-            # ips is a list of chunk strings; measure the widest chunk
             if c == "ips" and isinstance(val, list):
                 for chunk in val:
                     widths[c] = max(widths[c], len(chunk))
@@ -502,28 +398,19 @@ def _compute_widths(rendered: list[dict], totals_row: dict) -> dict[str, int]:
     return widths
 
 
-def _print_table_from_rows(
-    rendered: list[dict],
-    totals_row: dict,
-    title: str,
-    sort_by: str,
-    count: int,
-):
-    SEP = "  "  # 2-space gap between columns
+def _print_table(rendered, totals_row, title, sort_by, count):
+    SEP    = "  "
     widths = _compute_widths(rendered, totals_row)
-    cols = list(_HEADERS.keys())
-    # Pre-compute the blank prefix used for IP continuation lines:
-    # everything left of the ips column, padded to correct width.
-    ip_col_idx = cols.index("ips")
-    prefix_width = sum(widths[c] for c in cols[:ip_col_idx]) + len(SEP) * ip_col_idx
+    cols   = list(_HEADERS.keys())
 
-    def fmt_main(row: dict) -> str:
-        """Format the first (or only) line of a row."""
+    ip_idx       = cols.index("ips")
+    prefix_width = sum(widths[c] for c in cols[:ip_idx]) + len(SEP) * ip_idx
+
+    def fmt(row: dict) -> str:
         parts = []
         for c in cols:
             val = row.get(c, "")
             if c == "ips":
-                # first chunk only
                 first = val[0] if isinstance(val, list) and val else (val or "")
                 parts.append(f"{first:<{widths[c]}}")
             elif c in _LEFT:
@@ -532,41 +419,31 @@ def _print_table_from_rows(
                 parts.append(f"{val:>{widths[c]}}")
         return SEP.join(parts)
 
-    def fmt_ip_continuation(chunk: str) -> str:
-        """A line that is blank except for the ips column."""
+    def fmt_ip_cont(chunk: str) -> str:
         return " " * prefix_width + SEP + f"{chunk:<{widths['ips']}}"
 
-    header_row = {c: _HEADERS[c] for c in cols}
-    # header ips is just a plain string
+    header_row        = {c: _HEADERS[c] for c in cols}
     header_row["ips"] = _HEADERS["ips"]
-    line = fmt_main(header_row)
-    sep_line = "─" * len(line)
+    line     = fmt(header_row)
+    thin_sep = "─" * len(line)
 
     print(f"\n{'━' * len(line)}")
     print(f" {title}  (sorted by {sort_by}, {count} rows)")
-    print(sep_line)
+    print(thin_sep)
     print(line)
-    print(sep_line)
+    print(thin_sep)
 
     for row in rendered:
-        print(fmt_main(row))
-        ip_chunks = row.get("ips", [])
-        if isinstance(ip_chunks, list):
-            for chunk in ip_chunks[1:]:   # continuation lines
-                print(fmt_ip_continuation(chunk))
+        print(fmt(row))
+        for chunk in (row.get("ips") or [])[1:]:
+            print(fmt_ip_cont(chunk))
 
-    print(sep_line)
-    # totals row has ips="" (plain string)
-    print(fmt_main(totals_row))
+    print(thin_sep)
+    print(fmt(totals_row))
     print(f"{'━' * len(line)}")
 
 
-def print_table(
-    stats: dict[str, DomainStats],
-    unmatched: dict[str, DomainStats],
-    sort_by: str = "total",
-    min_bytes: int = 0,
-):
+def print_table(stats, unmatched, sort_by="total", min_bytes=0):
     sort_fn = SORT_KEYS.get(sort_by, SORT_KEYS["total"])
     reverse = sort_by != "domain"
 
@@ -583,66 +460,28 @@ def print_table(
         rows.sort(key=sort_fn, reverse=reverse)
         rendered = _render_rows(rows)
 
-        # Totals row
-        total_tx  = sum(s.tx_bytes   for s in rows)
-        total_rx  = sum(s.rx_bytes   for s in rows)
-        total_txp = sum(s.tx_packets for s in rows)
-        total_rxp = sum(s.rx_packets for s in rows)
+        total_tx  = sum(s.tx_bytes       for s in rows)
+        total_rx  = sum(s.rx_bytes       for s in rows)
+        total_txp = sum(s.tx_packets     for s in rows)
+        total_rxp = sum(s.rx_packets     for s in rows)
+        total_pay = sum(s.payload_bytes  for s in rows)
+        total_ovh = sum(s.overhead_bytes for s in rows)
+        total_all = total_tx + total_rx
+
         totals = {
-            "domain":    "TOTAL",
-            "ips":       "",
-            "tx":        human_bytes(total_tx),
-            "rx":        human_bytes(total_rx),
-            "tx_p":      f"{total_txp:,}",
-            "rx_p":      f"{total_rxp:,}",
-            "hs_pkt": "", "hs_bw": "", "rt_pkt": "", "rt_bw": "", "rst_pkt": "",
-            "tls_hs":    human_bytes(sum(s.tls_hs_bytes   for s in rows)),
-            "tls_data":  human_bytes(sum(s.tls_data_bytes for s in rows)),
-            "tls_hs_p": "", "tls_dat_p": "",
+            "domain":   "TOTAL",
+            "ips":      "",
+            "tx":       human_bytes(total_tx),
+            "rx":       human_bytes(total_rx),
+            "tx_p":     f"{total_txp:,}",
+            "rx_p":     f"{total_rxp:,}",
+            "payload":  human_bytes(total_pay),
+            "overhead": human_bytes(total_ovh),
+            "pay_pct":  f"{100*total_pay/total_all:.1f}%" if total_all else "",
+            "ovh_pct":  f"{100*total_ovh/total_all:.1f}%" if total_all else "",
         }
 
-        _print_table_from_rows(rendered, totals, label, sort_by, len(rows))
-
-
-def write_csv(
-    stats: dict[str, DomainStats],
-    unmatched: dict[str, DomainStats],
-    path: str,
-    min_bytes: int = 0,
-):
-    all_rows = list(stats.values()) + list(unmatched.values())
-    all_rows = [s for s in all_rows if s.total_bytes >= min_bytes]
-    all_rows.sort(key=lambda s: s.total_bytes, reverse=True)
-
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "domain", "ips", "resolved",
-            "tx_bytes", "rx_bytes", "total_bytes",
-            "tx_packets", "rx_packets", "total_packets",
-            "handshake_packets", "handshake_bytes",
-            "handshake_pct_packets", "handshake_pct_bytes",
-            "retrans_packets", "retrans_bytes",
-            "retrans_pct_packets", "retrans_pct_bytes",
-            "rst_packets", "rst_bytes", "rst_pct_packets",
-            "tls_hs_bytes", "tls_data_bytes",
-            "tls_hs_pct", "tls_data_pct",
-        ])
-        for s in all_rows:
-            resolved = s.domain not in unmatched
-            writer.writerow([
-                s.domain, "|".join(sorted(s.ips)), resolved,
-                s.tx_bytes, s.rx_bytes, s.total_bytes,
-                s.tx_packets, s.rx_packets, s.total_packets,
-                s.handshake_packets, s.handshake_bytes,
-                f"{s.handshake_pct_packets:.2f}", f"{s.handshake_pct_bytes:.2f}",
-                s.retrans_packets, s.retrans_bytes,
-                f"{s.retrans_pct_packets:.2f}", f"{s.retrans_pct_bytes:.2f}",
-                s.rst_packets, s.rst_bytes, f"{s.rst_pct_packets:.2f}",
-                s.tls_hs_bytes, s.tls_data_bytes,
-                f"{s.tls_hs_pct:.2f}", f"{s.tls_data_pct:.2f}",
-            ])
-    print(f"[*] CSV written to {path}")
+        _print_table(rendered, totals, label, sort_by, len(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -651,41 +490,25 @@ def write_csv(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze per-domain bandwidth from a pcap (tcp/443 + DNS/53)"
+        description="Per-domain payload vs overhead from a pcap (tcp/443 + DNS/53)"
     )
-    parser.add_argument("pcap", help="Path to the .pcap / .pcapng file")
+    parser.add_argument("pcap")
     parser.add_argument(
-        "--sort",
-        choices=list(SORT_KEYS.keys()),
-        default="total",
-        help="Sort column (default: total)",
+        "--sort", choices=list(SORT_KEYS.keys()), default="total",
+        help="Sort column (default: total)"
     )
     parser.add_argument(
-        "--min-bytes",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Hide entries with less than N total bytes (default: 0)",
+        "--min-bytes", type=int, default=0, metavar="N",
+        help="Hide entries with fewer than N total bytes"
     )
     parser.add_argument(
-        "--capture-ip",
-        metavar="IP",
-        default=None,
-        help="IP address of the captured host (auto-detected if omitted)",
-    )
-    parser.add_argument(
-        "--csv",
-        metavar="FILE",
-        default=None,
-        help="Also write results to a CSV file",
+        "--capture-ip", metavar="IP", default=None,
+        help="Capture host IP (auto-detected if omitted)"
     )
     args = parser.parse_args()
 
     stats, unmatched = analyze_pcap(args.pcap, capture_ip=args.capture_ip)
     print_table(stats, unmatched, sort_by=args.sort, min_bytes=args.min_bytes)
-
-    if args.csv:
-        write_csv(stats, unmatched, args.csv, min_bytes=args.min_bytes)
 
 
 if __name__ == "__main__":
