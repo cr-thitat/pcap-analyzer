@@ -246,25 +246,35 @@ def analyze_pcap(
                 )
             s = bucket[domain]
 
-            # TX / RX (IP-level bytes)
+            # RST: evict flow state, count toward TX/RX, skip TLS
+            if flags.get("RST"):
+                sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                tls_flow.pop((src, dst, sport, dport), None)
+                tls_flow.pop((dst, src, dport, sport), None)
+                if capture_ip and src == capture_ip:
+                    s.tx_bytes += size;  s.tx_packets += 1
+                else:
+                    s.rx_bytes += size;  s.rx_packets += 1
+                continue
+
+            # Retransmission guard — duplicate segments are overhead,
+            # count them in TX/RX but skip TLS so we don't double-count payload
+            is_retransmit = False
+            if len(pkt[TCP].payload) > 0:
+                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
+                if seq_key in seen_seq:
+                    is_retransmit = True
+                else:
+                    seen_seq.add(seq_key)
+
+            # TX / RX (IP-level bytes — every packet including retransmits)
             if capture_ip and src == capture_ip:
                 s.tx_bytes += size;  s.tx_packets += 1
             else:
                 s.rx_bytes += size;  s.rx_packets += 1
 
-            # RST: evict flow state, skip TLS
-            if flags.get("RST"):
-                sport, dport = pkt[TCP].sport, pkt[TCP].dport
-                tls_flow.pop((src, dst, sport, dport), None)
-                tls_flow.pop((dst, src, dport, sport), None)
-                continue
-
-            # Retransmission guard — skip duplicate segments for TLS accounting
-            if len(pkt[TCP].payload) > 0:
-                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
-                if seq_key in seen_seq:
-                    continue
-                seen_seq.add(seq_key)
+            if is_retransmit:
+                continue   # skip TLS accounting for retransmits
 
             # FIN: evict flow state
             if flags.get("FIN"):
