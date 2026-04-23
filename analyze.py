@@ -214,9 +214,10 @@ def analyze_pcap(
     stats:     dict[str, DomainStats] = {}
     unmatched: dict[str, DomainStats] = {}
 
-    # (src,dst,sport,dport,seq) → retransmit guard; evicted on FIN/RST
     seen_seq: set = set()
-    # fkey → [next_expected_seq, bytearray leftover]; at most ~16 KB per live flow
+    # fkey → [next_expected_seq, bytearray leftover]
+    # tls_data is always drained into the *current* s so it stays consistent
+    # with total_bytes (both follow the same domain-lookup path per packet).
     tls_flow: dict[tuple, list] = {}
 
     with PcapReader(path) as reader:
@@ -229,13 +230,18 @@ def analyze_pcap(
             size  = ip_pkt_size(pkt)
             flags = tcp_flags(pkt)
 
-            # Domain lookup
-            if dst in ip_to_domain:
-                domain, bucket = ip_to_domain[dst], stats
-            elif src in ip_to_domain:
-                domain, bucket = ip_to_domain[src], stats
+            # Determine direction
+            if capture_ip:
+                is_tx     = (src == capture_ip)
+                remote_ip = dst if is_tx else src
             else:
-                remote_ip      = dst if (capture_ip and src == capture_ip) else src
+                is_tx     = True
+                remote_ip = dst
+
+            # Domain lookup always on the remote side
+            if remote_ip in ip_to_domain:
+                domain, bucket = ip_to_domain[remote_ip], stats
+            else:
                 domain, bucket = remote_ip, unmatched
 
             if domain not in bucket:
@@ -245,46 +251,45 @@ def analyze_pcap(
                 )
             s = bucket[domain]
 
-            # RST: evict flow state, count toward TX/RX, skip TLS
-            if flags.get("RST"):
-                sport, dport = pkt[TCP].sport, pkt[TCP].dport
-                tls_flow.pop((src, dst, sport, dport), None)
-                tls_flow.pop((dst, src, dport, sport), None)
-                if capture_ip and src == capture_ip:
-                    s.tx_bytes += size;  s.tx_packets += 1
-                else:
-                    s.rx_bytes += size;  s.rx_packets += 1
-                continue
-
-            # Retransmission guard — duplicate segments are overhead,
-            # count them in TX/RX but skip TLS so we don't double-count payload
-            is_retransmit = False
-            if len(pkt[TCP].payload) > 0:
-                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
-                if seq_key in seen_seq:
-                    is_retransmit = True
-                else:
-                    seen_seq.add(seq_key)
-
-            # TX / RX (IP-level bytes — every packet including retransmits)
-            if capture_ip and src == capture_ip:
+            # TX / RX — every packet (including retransmits and RSTs) is real wire bytes
+            if is_tx:
                 s.tx_bytes += size;  s.tx_packets += 1
             else:
                 s.rx_bytes += size;  s.rx_packets += 1
 
-            if is_retransmit:
-                continue   # skip TLS accounting for retransmits
+            # RST: evict flow state, no TLS content
+            if flags.get("RST"):
+                sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                tls_flow.pop((src, dst, sport, dport), None)
+                tls_flow.pop((dst, src, dport, sport), None)
+                continue
 
-            # FIN: evict flow state
+            # Retransmission guard — already counted in TX/RX above,
+            # but skip TLS reassembly to avoid double-counting payload bytes
+            if len(pkt[TCP].payload) > 0:
+                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
+                if seq_key in seen_seq:
+                    continue   # retransmit: wire bytes counted, TLS skipped
+                seen_seq.add(seq_key)
+
+            # TLS reassembly (port 443 only)
+            if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
+                # FIN on non-TLS flows: evict just in case
+                if flags.get("FIN"):
+                    sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                    tls_flow.pop((src, dst, sport, dport), None)
+                    tls_flow.pop((dst, src, dport, sport), None)
+                continue
+
+            raw = bytes(pkt[TCP].payload)
+
+            # FIN eviction happens *after* we grab the payload, so any data
+            # carried on the FIN segment is still processed below
             if flags.get("FIN"):
                 sport, dport = pkt[TCP].sport, pkt[TCP].dport
                 tls_flow.pop((src, dst, sport, dport), None)
                 tls_flow.pop((dst, src, dport, sport), None)
 
-            # TLS reassembly (port 443 only)
-            if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
-                continue
-            raw = bytes(pkt[TCP].payload)
             if not raw:
                 continue
 
@@ -292,24 +297,23 @@ def analyze_pcap(
             seq  = pkt[TCP].seq
 
             if fkey not in tls_flow:
-                # Bind this flow to the domain stats object current at creation
-                # time. If the domain mapping changes mid-capture (DNS arrives
-                # late), records still drain into the right bucket.
-                tls_flow[fkey] = [seq, bytearray(), s]
+                tls_flow[fkey] = [seq, bytearray()]
 
             state          = tls_flow[fkey]
             next_seq       = state[0]
             buf: bytearray = state[1]
-            tls_s          = state[2]   # always the original domain for this flow
 
             if seq == next_seq:
                 buf += raw;   state[0] = seq + len(raw)
             elif seq > next_seq:
+                # Gap: drop partial record, restart from here
                 buf.clear();  buf += raw;  state[0] = seq + len(raw)
             else:
-                continue   # already-seen retransmit
+                continue   # seq < next_seq: retransmit, already handled above
 
-            # Drain complete TLS records, count only ApplicationData
+            # Drain complete TLS records into the *current* s.
+            # This keeps tls_data_bytes and total_bytes on the same domain,
+            # even if the IP→domain mapping changed mid-capture.
             pos = 0
             while pos + 5 <= len(buf):
                 ct      = buf[pos]
@@ -320,10 +324,10 @@ def analyze_pcap(
                     buf.clear(); break
 
                 if pos + 5 + rec_len > len(buf):
-                    break   # incomplete — wait for next segment
+                    break   # incomplete record — wait for next segment
 
                 if ct == _TLS_APP_DATA:
-                    tls_s.tls_data_bytes += rec_len
+                    s.tls_data_bytes += rec_len
 
                 pos += 5 + rec_len
 
