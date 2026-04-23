@@ -58,13 +58,12 @@ class DomainStats:
 
     @property
     def payload_bytes(self):
-        """TLS ApplicationData bytes — the actual useful content."""
-        return self.tls_data_bytes
+        """TLS ApplicationData bytes — clamped to total so overhead is never negative."""
+        return min(self.tls_data_bytes, self.total_bytes)
 
     @property
     def overhead_bytes(self):
-        """Everything that isn't payload: headers, handshakes, ACKs, retransmits…"""
-        return self.total_bytes - self.tls_data_bytes
+        return self.total_bytes - self.payload_bytes
 
     @property
     def payload_pct(self):
@@ -293,11 +292,15 @@ def analyze_pcap(
             seq  = pkt[TCP].seq
 
             if fkey not in tls_flow:
-                tls_flow[fkey] = [seq, bytearray()]
+                # Bind this flow to the domain stats object current at creation
+                # time. If the domain mapping changes mid-capture (DNS arrives
+                # late), records still drain into the right bucket.
+                tls_flow[fkey] = [seq, bytearray(), s]
 
             state          = tls_flow[fkey]
             next_seq       = state[0]
             buf: bytearray = state[1]
+            tls_s          = state[2]   # always the original domain for this flow
 
             if seq == next_seq:
                 buf += raw;   state[0] = seq + len(raw)
@@ -320,7 +323,7 @@ def analyze_pcap(
                     break   # incomplete — wait for next segment
 
                 if ct == _TLS_APP_DATA:
-                    s.tls_data_bytes += rec_len
+                    tls_s.tls_data_bytes += rec_len
 
                 pos += 5 + rec_len
 
