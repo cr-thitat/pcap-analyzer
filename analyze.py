@@ -235,6 +235,7 @@ def analyze_pcap(
                             domain_ips[sni].add(server_ip)
                         elif ip_to_domain[server_ip] != sni:
                             domain_ips[sni].add(server_ip)
+                            ip_to_domain[server_ip] = sni
 
     print(
         f"[*] {pkt_count:,} packets | "
