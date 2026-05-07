@@ -87,7 +87,14 @@ def human_bytes(n: int) -> str:
 
 
 def ip_pkt_size(pkt) -> int:
-    return pkt[IP].len if IP in pkt else len(pkt)
+    if IP not in pkt:
+        return len(pkt)
+    ip_len = pkt[IP].len
+    if ip_len >= 20:
+        return ip_len
+    # TSO/GRO: IP.len not filled in by kernel at capture time.
+    # len(pkt) is the captured Ethernet frame; subtract 14-byte Ethernet header.
+    return max(20, len(pkt) - 14)
 
 
 def tcp_flags(pkt) -> dict:
@@ -137,6 +144,15 @@ def extract_sni(payload: bytes) -> Optional[str]:
 _TLS_APP_DATA = 0x17
 _TLS_VERSIONS = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}
 
+_SEQ_MASK = 0xFFFFFFFF
+_SEQ_HALF = 0x80000000
+
+
+def _seq_diff(newer: int, older: int) -> int:
+    """Signed distance in 32-bit TCP sequence number space."""
+    diff = (newer - older) & _SEQ_MASK
+    return diff if diff < _SEQ_HALF else diff - (1 << 32)
+
 
 # ---------------------------------------------------------------------------
 # Core analysis — two-pass streaming
@@ -160,6 +176,10 @@ def analyze_pcap(
     ip_to_domain: dict[str, str] = {}
     domain_ips:   dict[str, set] = defaultdict(set)
     dns_srcs:     dict[str, int] = defaultdict(int)
+    # Maps (src, dst, sport, dport) of TLS ClientHello → SNI domain.
+    # Used in Pass B to attribute traffic per flow, not just per IP.
+    # Needed because multiple domains can share the same IP.
+    sni_flow:     dict[tuple, str] = {}
     pkt_count = 0
 
     with PcapReader(path) as reader:
@@ -190,6 +210,8 @@ def analyze_pcap(
                     sni = extract_sni(raw)
                     if sni:
                         server_ip = pkt[IP].dst
+                        fkey = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport)
+                        sni_flow[fkey] = sni
                         if server_ip not in ip_to_domain:
                             ip_to_domain[server_ip] = sni
                             domain_ips[sni].add(server_ip)
@@ -238,8 +260,16 @@ def analyze_pcap(
                 is_tx     = True
                 remote_ip = dst
 
-            # Domain lookup always on the remote side
-            if remote_ip in ip_to_domain:
+            # Domain lookup: flow-level SNI first (handles shared IPs), then IP-level DNS
+            sport = pkt[TCP].sport
+            dport = pkt[TCP].dport
+            fkey_fwd = (src, dst, sport, dport)
+            fkey_rev = (dst, src, dport, sport)
+            if fkey_fwd in sni_flow:
+                domain, bucket = sni_flow[fkey_fwd], stats
+            elif fkey_rev in sni_flow:
+                domain, bucket = sni_flow[fkey_rev], stats
+            elif remote_ip in ip_to_domain:
                 domain, bucket = ip_to_domain[remote_ip], stats
             else:
                 domain, bucket = remote_ip, unmatched
@@ -259,7 +289,6 @@ def analyze_pcap(
 
             # RST: evict flow state, no TLS content
             if flags.get("RST"):
-                sport, dport = pkt[TCP].sport, pkt[TCP].dport
                 tls_flow.pop((src, dst, sport, dport), None)
                 tls_flow.pop((dst, src, dport, sport), None)
                 continue
@@ -267,16 +296,15 @@ def analyze_pcap(
             # Retransmission guard — already counted in TX/RX above,
             # but skip TLS reassembly to avoid double-counting payload bytes
             if len(pkt[TCP].payload) > 0:
-                seq_key = (src, dst, pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].seq)
+                seq_key = (src, dst, sport, dport, pkt[TCP].seq)
                 if seq_key in seen_seq:
                     continue   # retransmit: wire bytes counted, TLS skipped
                 seen_seq.add(seq_key)
 
             # TLS reassembly (port 443 only)
-            if pkt[TCP].dport != 443 and pkt[TCP].sport != 443:
+            if dport != 443 and sport != 443:
                 # FIN on non-TLS flows: evict just in case
                 if flags.get("FIN"):
-                    sport, dport = pkt[TCP].sport, pkt[TCP].dport
                     tls_flow.pop((src, dst, sport, dport), None)
                     tls_flow.pop((dst, src, dport, sport), None)
                 continue
@@ -286,30 +314,30 @@ def analyze_pcap(
             # FIN eviction happens *after* we grab the payload, so any data
             # carried on the FIN segment is still processed below
             if flags.get("FIN"):
-                sport, dport = pkt[TCP].sport, pkt[TCP].dport
                 tls_flow.pop((src, dst, sport, dport), None)
                 tls_flow.pop((dst, src, dport, sport), None)
 
             if not raw:
                 continue
 
-            fkey = (src, dst, pkt[TCP].sport, pkt[TCP].dport)
+            fkey = (src, dst, sport, dport)
             seq  = pkt[TCP].seq
 
             if fkey not in tls_flow:
-                tls_flow[fkey] = [seq, bytearray()]
+                tls_flow[fkey] = [seq & _SEQ_MASK, bytearray()]
 
             state          = tls_flow[fkey]
             next_seq       = state[0]
             buf: bytearray = state[1]
 
-            if seq == next_seq:
-                buf += raw;   state[0] = seq + len(raw)
-            elif seq > next_seq:
+            dist = _seq_diff(seq, next_seq)
+            if dist == 0:
+                buf += raw;  state[0] = (seq + len(raw)) & _SEQ_MASK
+            elif dist > 0:
                 # Gap: drop partial record, restart from here
-                buf.clear();  buf += raw;  state[0] = seq + len(raw)
+                buf.clear();  buf += raw;  state[0] = (seq + len(raw)) & _SEQ_MASK
             else:
-                continue   # seq < next_seq: retransmit, already handled above
+                continue   # seq behind next_seq: retransmit, already handled above
 
             # Drain complete TLS records into the *current* s.
             # This keeps tls_data_bytes and total_bytes on the same domain,
